@@ -77,7 +77,7 @@ void msg_func(msg_type_t msg_type, const char *message_id, linefile_type linefil
 	message += vstringf(msg, args);
 
 	if (msg_type == VERIFIC_ERROR || msg_type == VERIFIC_WARNING || msg_type == VERIFIC_PROGRAM_ERROR)
-		log_warning("%s\n", message.c_str());
+		log_warning_noprefix("%s\n", message.c_str());
 	else
 		log("%s\n", message.c_str());
 }
@@ -97,6 +97,13 @@ void import_sva_assert(VerificImporter *importer, Instance *inst);
 void import_sva_assume(VerificImporter *importer, Instance *inst);
 void import_sva_cover(VerificImporter *importer, Instance *inst);
 
+struct VerificClockEdge {
+	Net *clock_net;
+	SigBit clock_sig;
+	bool posedge;
+	VerificClockEdge(VerificImporter *importer, Instance *inst);
+};
+
 struct VerificImporter
 {
 	RTLIL::Module *module;
@@ -105,13 +112,14 @@ struct VerificImporter
 	std::map<Net*, RTLIL::SigBit> net_map;
 	std::map<Net*, Net*> sva_posedge_map;
 
-	bool mode_gates, mode_keep, verbose;
+	bool mode_gates, mode_keep, mode_nosva, mode_names, verbose;
 
 	pool<int> verific_sva_prims;
 	pool<int> verific_psl_prims;
 
-	VerificImporter(bool mode_gates, bool mode_keep, bool verbose) :
-			mode_gates(mode_gates), mode_keep(mode_keep), verbose(verbose)
+	VerificImporter(bool mode_gates, bool mode_keep, bool mode_nosva, bool mode_names, bool verbose) :
+			mode_gates(mode_gates), mode_keep(mode_keep),
+			mode_nosva(mode_nosva), mode_names(mode_names), verbose(verbose)
 	{
 		// Copy&paste from Verific 3.16_484_32_170630 Netlist.h
 		vector<int> sva_prims {
@@ -159,7 +167,7 @@ struct VerificImporter
 			PRIM_NONCONS_REP, PRIM_GOTO_REP
 		};
 
-		for (int p : sva_prims)
+		for (int p : psl_prims)
 			verific_psl_prims.insert(p);
 	}
 
@@ -628,6 +636,73 @@ struct VerificImporter
 		return false;
 	}
 
+	void merge_past_ffs_clock(pool<RTLIL::Cell*> &candidates, SigBit clock, bool clock_pol)
+	{
+		bool keep_running = true;
+		SigMap sigmap;
+
+		while (keep_running)
+		{
+			keep_running = false;
+
+			dict<SigBit, pool<RTLIL::Cell*>> dbits_db;
+			SigSpec dbits;
+
+			for (auto cell : candidates) {
+				SigBit bit = sigmap(cell->getPort("\\D"));
+				dbits_db[bit].insert(cell);
+				dbits.append(bit);
+			}
+
+			dbits.sort_and_unify();
+
+			for (auto chunk : dbits.chunks())
+			{
+				SigSpec sig_d = chunk;
+
+				if (chunk.wire == nullptr || GetSize(sig_d) == 1)
+					continue;
+
+				SigSpec sig_q = module->addWire(NEW_ID, GetSize(sig_d));
+				RTLIL::Cell *new_ff = module->addDff(NEW_ID, clock, sig_d, sig_q, clock_pol);
+
+				if (verbose)
+					log("  merging single-bit past_ffs into new %d-bit ff %s.\n", GetSize(sig_d), log_id(new_ff));
+
+				for (int i = 0; i < GetSize(sig_d); i++)
+					for (auto old_ff : dbits_db[sig_d[i]])
+					{
+						if (verbose)
+							log("    replacing old ff %s on bit %d.\n", log_id(old_ff), i);
+
+						SigBit old_q = old_ff->getPort("\\Q");
+						SigBit new_q = sig_q[i];
+
+						sigmap.add(old_q, new_q);
+						module->connect(old_q, new_q);
+						candidates.erase(old_ff);
+						module->remove(old_ff);
+						keep_running = true;
+					}
+			}
+		}
+	}
+
+	void merge_past_ffs(pool<RTLIL::Cell*> &candidates)
+	{
+		dict<pair<SigBit, int>, pool<RTLIL::Cell*>> database;
+
+		for (auto cell : candidates)
+		{
+			SigBit clock = cell->getPort("\\CLK");
+			bool clock_pol = cell->getParam("\\CLK_POLARITY").as_bool();
+			database[make_pair(clock, int(clock_pol))].insert(cell);
+		}
+
+		for (auto it : database)
+			merge_past_ffs_clock(it.second, it.first.first, it.first.second);
+	}
+
 	void import_netlist(RTLIL::Design *design, Netlist *nl, std::set<Netlist*> &nl_todo)
 	{
 		std::string module_name = nl->IsOperator() ? std::string("$verific$") + nl->Owner()->Name() : RTLIL::escape_id(nl->Owner()->Name());
@@ -813,7 +888,7 @@ struct VerificImporter
 			if (net->Bus())
 				continue;
 
-			RTLIL::IdString wire_name = module->uniquify(net->IsUserDeclared() ? RTLIL::escape_id(net->Name()) : NEW_ID);
+			RTLIL::IdString wire_name = module->uniquify(mode_names || net->IsUserDeclared() ? RTLIL::escape_id(net->Name()) : NEW_ID);
 
 			if (verbose)
 				log("  importing net %s as %s.\n", net->Name(), log_id(wire_name));
@@ -837,10 +912,11 @@ struct VerificImporter
 
 			if (found_new_net)
 			{
-				if (verbose)
-					log("  importing netbus %s.\n", netbus->Name());
+				RTLIL::IdString wire_name = module->uniquify(mode_names || netbus->IsUserDeclared() ? RTLIL::escape_id(net->Name()) : NEW_ID);
 
-				RTLIL::IdString wire_name = module->uniquify(RTLIL::escape_id(netbus->Name()));
+				if (verbose)
+					log("  importing netbus %s as %s.\n", netbus->Name(), log_id(wire_name));
+
 				RTLIL::Wire *wire = module->addWire(wire_name, netbus->Size());
 				wire->start_offset = min(netbus->LeftIndex(), netbus->RightIndex());
 				import_attributes(wire->attributes, netbus);
@@ -938,9 +1014,11 @@ struct VerificImporter
 		pool<Instance*, hash_ptr_ops> sva_assumes;
 		pool<Instance*, hash_ptr_ops> sva_covers;
 
+		pool<RTLIL::Cell*> past_ffs;
+
 		FOREACH_INSTANCE_OF_NETLIST(nl, mi, inst)
 		{
-			RTLIL::IdString inst_name = module->uniquify(inst->IsUserDeclared() ? RTLIL::escape_id(inst->Name()) : NEW_ID);
+			RTLIL::IdString inst_name = module->uniquify(mode_names || inst->IsUserDeclared() ? RTLIL::escape_id(inst->Name()) : NEW_ID);
 
 			if (verbose)
 				log("  importing cell %s (%s) as %s.\n", inst->Name(), inst->View()->Owner()->Name(), log_id(inst_name));
@@ -1042,21 +1120,67 @@ struct VerificImporter
 			if (!mode_gates) {
 				if (import_netlist_instance_cells(inst, inst_name))
 					continue;
-				if (inst->IsOperator())
+				if (inst->IsOperator() && !verific_sva_prims.count(inst->Type()) && !verific_psl_prims.count(inst->Type()))
 					log_warning("Unsupported Verific operator: %s (fallback to gate level implementation provided by verific)\n", inst->View()->Owner()->Name());
 			} else {
 				if (import_netlist_instance_gates(inst, inst_name))
 					continue;
 			}
 
-			if (inst->Type() == PRIM_SVA_ASSERT)
+			if (inst->Type() == PRIM_SVA_ASSERT || inst->Type() == PRIM_PSL_ASSERT)
 				sva_asserts.insert(inst);
 
-			if (inst->Type() == PRIM_SVA_ASSUME)
-				sva_asserts.insert(inst);
+			if (inst->Type() == PRIM_SVA_ASSUME || inst->Type() == PRIM_PSL_ASSUME)
+				sva_assumes.insert(inst);
 
-			if (inst->Type() == PRIM_SVA_COVER)
+			if (inst->Type() == PRIM_SVA_COVER || inst->Type() == PRIM_PSL_COVER)
 				sva_covers.insert(inst);
+
+			if (inst->Type() == PRIM_SVA_PAST && !mode_nosva)
+			{
+				VerificClockEdge clock_edge(this, inst->GetInput2()->Driver());
+
+				SigBit sig_d = net_map_at(inst->GetInput1());
+				SigBit sig_q = net_map_at(inst->GetOutput());
+
+				if (verbose)
+					log("    %sedge FF with D=%s, Q=%s, C=%s.\n", clock_edge.posedge ? "pos" : "neg",
+							log_signal(sig_d), log_signal(sig_q), log_signal(clock_edge.clock_sig));
+
+				past_ffs.insert(module->addDff(NEW_ID, clock_edge.clock_sig, sig_d, sig_q, clock_edge.posedge));
+
+				if (!mode_keep)
+					continue;
+			}
+
+			if (inst->Type() == OPER_PSLPREV && !mode_nosva)
+			{
+				Net *clock = inst->GetClock();
+
+				if (!clock->IsConstant())
+				{
+					VerificClockEdge clock_edge(this, clock->Driver());
+
+					SigSpec sig_d, sig_q;
+
+					for (int i = 0; i < int(inst->InputSize()); i++) {
+						sig_d.append(net_map_at(inst->GetInputBit(i)));
+						sig_q.append(net_map_at(inst->GetOutputBit(i)));
+					}
+
+					if (verbose)
+						log("    %sedge FF with D=%s, Q=%s, C=%s.\n", clock_edge.posedge ? "pos" : "neg",
+								log_signal(sig_d), log_signal(sig_q), log_signal(clock_edge.clock_sig));
+
+					RTLIL::Cell *ff = module->addDff(NEW_ID, clock_edge.clock_sig, sig_d, sig_q, clock_edge.posedge);
+
+					if (inst->InputSize() == 1)
+						past_ffs.insert(ff);
+
+					if (!mode_keep)
+						continue;
+				}
+			}
 
 			if (!mode_keep && (verific_sva_prims.count(inst->Type()) || verific_psl_prims.count(inst->Type()))) {
 				if (verbose)
@@ -1116,16 +1240,110 @@ struct VerificImporter
 			}
 		}
 
-		for (auto inst : sva_asserts)
-			import_sva_assert(this, inst);
+		if (!mode_nosva)
+		{
+			for (auto inst : sva_asserts)
+				import_sva_assert(this, inst);
 
-		for (auto inst : sva_assumes)
-			import_sva_assume(this, inst);
+			for (auto inst : sva_assumes)
+				import_sva_assume(this, inst);
 
-		for (auto inst : sva_covers)
-			import_sva_cover(this, inst);
+			for (auto inst : sva_covers)
+				import_sva_cover(this, inst);
+
+			merge_past_ffs(past_ffs);
+		}
 	}
 };
+
+Net *verific_follow_inv(Net *w)
+{
+	if (w == nullptr || w->IsMultipleDriven())
+		return nullptr;
+
+	Instance *i = w->Driver();
+	if (i == nullptr || i->Type() != PRIM_INV)
+		return nullptr;
+
+	return i->GetInput();
+}
+
+Net *verific_follow_pslprev(Net *w)
+{
+	if (w == nullptr || w->IsMultipleDriven())
+		return nullptr;
+
+	Instance *i = w->Driver();
+	if (i == nullptr || i->Type() != OPER_PSLPREV || i->InputSize() != 1)
+		return nullptr;
+
+	return i->GetInputBit(0);
+}
+
+Net *verific_follow_inv_pslprev(Net *w)
+{
+	w = verific_follow_inv(w);
+	return verific_follow_pslprev(w);
+}
+
+VerificClockEdge::VerificClockEdge(VerificImporter *importer, Instance *inst)
+{
+	log_assert(importer != nullptr);
+	log_assert(inst != nullptr);
+
+	// SVA posedge/negedge
+	if (inst->Type() == PRIM_SVA_POSEDGE)
+	{
+		clock_net = inst->GetInput();
+		posedge = true;
+
+		Instance *driver = clock_net->Driver();
+		if (!clock_net->IsMultipleDriven() && driver && driver->Type() == PRIM_INV) {
+			clock_net = driver->GetInput();
+			posedge = false;
+		}
+
+		clock_sig = importer->net_map_at(clock_net);
+		return;
+	}
+
+	// VHDL-flavored PSL clock
+	if (inst->Type() == PRIM_AND)
+	{
+		Net *w1 = inst->GetInput1();
+		Net *w2 = inst->GetInput2();
+
+		clock_net = verific_follow_inv_pslprev(w1);
+		if (clock_net == w2) {
+			clock_sig = importer->net_map_at(clock_net);
+			posedge = true;
+			return;
+		}
+
+		clock_net = verific_follow_inv_pslprev(w2);
+		if (clock_net == w1) {
+			clock_sig = importer->net_map_at(clock_net);
+			posedge = true;
+			return;
+		}
+
+		clock_net = verific_follow_pslprev(w1);
+		if (clock_net == verific_follow_inv(w2)) {
+			clock_sig = importer->net_map_at(clock_net);
+			posedge = false;
+			return;
+		}
+
+		clock_net = verific_follow_pslprev(w2);
+		if (clock_net == verific_follow_inv(w1)) {
+			clock_sig = importer->net_map_at(clock_net);
+			posedge = false;
+			return;
+		}
+
+		log_abort();
+	}
+}
 
 struct VerificSvaImporter
 {
@@ -1139,9 +1357,6 @@ struct VerificSvaImporter
 	bool clock_posedge = false;
 
 	SigBit disable_iff = State::S0;
-
-	bool import_sva_disable_hiactive = true;
-	int import_sva_init_disable_steps = 0;
 
 	bool mode_assert = false;
 	bool mode_assume = false;
@@ -1164,6 +1379,9 @@ struct VerificSvaImporter
 				!importer->verific_psl_prims.count(inst->Type()))
 			return nullptr;
 
+		if (inst->Type() == PRIM_SVA_PAST)
+			return nullptr;
+
 		return inst;
 	}
 
@@ -1173,18 +1391,130 @@ struct VerificSvaImporter
 	Instance *get_ast_input3(Instance *inst) { return net_to_ast_driver(inst->GetInput3()); }
 	Instance *get_ast_control(Instance *inst) { return net_to_ast_driver(inst->GetControl()); }
 
-	SigBit parse_sequence(Net *n)
+	struct sequence_t {
+		int length = 0;
+		SigBit sig_a = State::S1;
+		SigBit sig_en = State::S1;
+	};
+
+	void sequence_cond(sequence_t &seq, SigBit cond)
+	{
+		seq.sig_a = module->And(NEW_ID, seq.sig_a, cond);
+	}
+
+	void sequence_ff(sequence_t &seq)
+	{
+		if (disable_iff != State::S0)
+			seq.sig_en = module->Mux(NEW_ID, seq.sig_en, State::S0, disable_iff);
+
+		Wire *sig_a_q = module->addWire(NEW_ID);
+		sig_a_q->attributes["\\init"] = Const(0, 1);
+
+		Wire *sig_en_q = module->addWire(NEW_ID);
+		sig_en_q->attributes["\\init"] = Const(0, 1);
+
+		module->addDff(NEW_ID, clock, seq.sig_a, sig_a_q, clock_posedge);
+		module->addDff(NEW_ID, clock, seq.sig_en, sig_en_q, clock_posedge);
+
+		seq.length++;
+		seq.sig_a = sig_a_q;
+		seq.sig_en = sig_en_q;
+	}
+
+	void parse_sequence(sequence_t &seq, Net *n)
 	{
 		Instance *inst = net_to_ast_driver(n);
 
-		if (inst == nullptr)
-			return importer->net_map_at(n);
+		// Regular expression
+
+		if (inst == nullptr) {
+			sequence_cond(seq, importer->net_map_at(n));
+			return;
+		}
+
+		// SVA Primitives
+
+		if (inst->Type() == PRIM_SVA_OVERLAPPED_IMPLICATION)
+		{
+			parse_sequence(seq, inst->GetInput1());
+			seq.sig_en = module->And(NEW_ID, seq.sig_en, seq.sig_a);
+			parse_sequence(seq, inst->GetInput2());
+			return;
+		}
+
+		if (inst->Type() == PRIM_SVA_NON_OVERLAPPED_IMPLICATION)
+		{
+			parse_sequence(seq, inst->GetInput1());
+			seq.sig_en = module->And(NEW_ID, seq.sig_en, seq.sig_a);
+			sequence_ff(seq);
+			parse_sequence(seq, inst->GetInput2());
+			return;
+		}
+
+		if (inst->Type() == PRIM_SVA_SEQ_CONCAT)
+		{
+			int sva_low = atoi(inst->GetAttValue("sva:low"));
+			int sva_high = atoi(inst->GetAttValue("sva:low"));
+
+			if (sva_low != sva_high)
+				log_error("Ranges on SVA sequence concatenation operator are not supported at the moment.\n");
+
+			parse_sequence(seq, inst->GetInput1());
+
+			for (int i = 0; i < sva_low; i++)
+				sequence_ff(seq);
+
+			parse_sequence(seq, inst->GetInput2());
+			return;
+		}
+
+		if (inst->Type() == PRIM_SVA_CONSECUTIVE_REPEAT)
+		{
+			int sva_low = atoi(inst->GetAttValue("sva:low"));
+			int sva_high = atoi(inst->GetAttValue("sva:low"));
+
+			if (sva_low != sva_high)
+				log_error("Ranges on SVA consecutive repeat operator are not supported at the moment.\n");
+
+			parse_sequence(seq, inst->GetInput());
+
+			for (int i = 1; i < sva_low; i++) {
+				sequence_ff(seq);
+				parse_sequence(seq, inst->GetInput());
+			}
+			return;
+		}
+
+		// PSL Primitives
+
+		if (inst->Type() == PRIM_ALWAYS)
+		{
+			parse_sequence(seq, inst->GetInput());
+			return;
+		}
+
+		if (inst->Type() == PRIM_IMPL)
+		{
+			parse_sequence(seq, inst->GetInput1());
+			seq.sig_en = module->And(NEW_ID, seq.sig_en, seq.sig_a);
+			parse_sequence(seq, inst->GetInput2());
+			return;
+		}
+
+		if (inst->Type() == PRIM_SUFFIX_IMPL)
+		{
+			parse_sequence(seq, inst->GetInput1());
+			seq.sig_en = module->And(NEW_ID, seq.sig_en, seq.sig_a);
+			sequence_ff(seq);
+			parse_sequence(seq, inst->GetInput2());
+			return;
+		}
+
+		// Handle unsupported primitives
 
 		if (!importer->mode_keep)
 			log_error("Unsupported Verific SVA primitive %s of type %s.\n", inst->Name(), inst->View()->Owner()->Name());
 		log_warning("Unsupported Verific SVA primitive %s of type %s.\n", inst->Name(), inst->View()->Owner()->Name());
-
-		return importer->net_map_at(n);
 	}
 
 	void run()
@@ -1195,60 +1525,39 @@ struct VerificSvaImporter
 		// parse SVA property clock event
 
 		Instance *at_node = get_ast_input(root);
-		log_assert(at_node && at_node->Type() == PRIM_SVA_AT);
+		log_assert(at_node && (at_node->Type() == PRIM_SVA_AT || at_node->Type() == PRIM_AT));
 
-		Instance *clock_node = get_ast_input1(at_node);
-		log_assert(clock_node && (clock_node->Type() == PRIM_SVA_POSEDGE || clock_node->Type() == PRIM_SVA_POSEDGE));
-
-		clock = importer->net_map_at(clock_node->GetInput());
-		clock_posedge = (clock_node->Type() == PRIM_SVA_POSEDGE);
-
-		import_sva_init_disable_steps = 1;
+		VerificClockEdge clock_edge(importer, at_node->Type() == PRIM_SVA_AT ? get_ast_input1(at_node) : at_node->GetInput2()->Driver());
+		clock = clock_edge.clock_sig;
+		clock_posedge = clock_edge.posedge;
 
 		// parse disable_iff expression
 
-		Net *sequence_net = at_node->GetInput2();
+		Net *sequence_net = at_node->Type() == PRIM_SVA_AT ? at_node->GetInput2() : at_node->GetInput1();
 		Instance *sequence_node = net_to_ast_driver(sequence_net);
 
 		if (sequence_node && sequence_node->Type() == PRIM_SVA_DISABLE_IFF) {
 			disable_iff = importer->net_map_at(sequence_node->GetInput1());
 			sequence_net = sequence_node->GetInput2();
+		} else
+		if (sequence_node && sequence_node->Type() == PRIM_ABORT) {
+			disable_iff = importer->net_map_at(sequence_node->GetInput2());
+			sequence_net = sequence_node->GetInput1();
 		}
 
 		// parse SVA sequence into trigger signal
 
-		SigBit sig_a_d = parse_sequence(sequence_net);
-		Wire *sig_a_q = module->addWire(NEW_ID);
-		sig_a_q->attributes["\\init"] = Const(import_sva_disable_hiactive ? State::S1 : State::S0, 1);
-		module->addDff(NEW_ID, clock, sig_a_d, sig_a_q, clock_posedge);
-
-		// generate properly delayed enable signal
-
-		SigBit sig_en = State::S1;
-
-		if (disable_iff != State::S0)
-			sig_en = module->Mux(NEW_ID, sig_en, State::S0, disable_iff);
-
-		for (int i = 0; i < import_sva_init_disable_steps; i++)
-		{
-			Wire *new_en = module->addWire(NEW_ID);
-			new_en->attributes["\\init"] = Const(0, 1);
-
-			module->addDff(NEW_ID, clock, sig_en, new_en, clock_posedge);
-
-			if (disable_iff != State::S0 && i+1 < import_sva_init_disable_steps)
-				sig_en = module->Mux(NEW_ID, new_en, State::S0, disable_iff);
-			else
-				sig_en = new_en;
-		}
+		sequence_t seq;
+		parse_sequence(seq, sequence_net);
+		sequence_ff(seq);
 
 		// generate assert/assume/cover cell
 
-		RTLIL::IdString root_name = module->uniquify(root->IsUserDeclared() ? RTLIL::escape_id(root->Name()) : NEW_ID);
+		RTLIL::IdString root_name = module->uniquify(importer->mode_names || root->IsUserDeclared() ? RTLIL::escape_id(root->Name()) : NEW_ID);
 
-		if (mode_assert) module->addAssert(root_name, sig_a_q, sig_en);
-		if (mode_assume) module->addAssume(root_name, sig_a_q, sig_en);
-		if (mode_cover) module->addCover(root_name, sig_a_q, sig_en);
+		if (mode_assert) module->addAssert(root_name, seq.sig_a, seq.sig_en);
+		if (mode_assume) module->addAssume(root_name, seq.sig_a, seq.sig_en);
+		if (mode_cover) module->addCover(root_name, seq.sig_a, seq.sig_en);
 	}
 };
 
@@ -1370,12 +1679,12 @@ struct VerificPass : public Pass {
 	{
 		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
 		log("\n");
-		log("    verific {-vlog95|-vlog2k|-sv2005|-sv2009|-sv} <verilog-file>..\n");
+		log("    verific {-vlog95|-vlog2k|-sv2005|-sv2009|-sv2012|-sv} <verilog-file>..\n");
 		log("\n");
 		log("Load the specified Verilog/SystemVerilog files into Verific.\n");
 		log("\n");
 		log("\n");
-		log("    verific {-vhdl87|-vhdl93|-vhdl2k|-vhdl2008|-vhdpsl} <vhdl-file>..\n");
+		log("    verific {-vhdl87|-vhdl93|-vhdl2k|-vhdl2008|-vhdl|-vhdpsl} <vhdl-file>..\n");
 		log("\n");
 		log("Load the specified VHDL files into Verific.\n");
 		log("\n");
@@ -1400,12 +1709,25 @@ struct VerificPass : public Pass {
 		log("  -extnets\n");
 		log("    Resolve references to external nets by adding module ports as needed.\n");
 		log("\n");
+		log("  -nosva\n");
+		log("    Ignore SVA properties, do not infer checker logic. (This also disables\n");
+		log("    PSL properties in -vhdpsl mode.)\n");
+		log("\n");
 		log("  -v\n");
 		log("    Verbose log messages.\n");
+		log("\n");
+		log("The following additional import options are useful for debugging the Verific\n");
+		log("bindings (for Yosys and/or Verific developers):\n");
 		log("\n");
 		log("  -k\n");
 		log("    Keep going after an unsupported verific primitive is found. The\n");
 		log("    unsupported primitive is added as blockbox module to the design.\n");
+		log("    This will also add all SVA related cells to the design parallel to\n");
+		log("    the checker logic inferred by it.\n");
+		log("\n");
+		log("  -n\n");
+		log("    Keep all Verific names on instances and nets. By default only\n");
+		log("    user-declared names are preserved.\n");
 		log("\n");
 		log("  -d <dump_file>\n");
 		log("    Dump the Verific netlist as a verilog file.\n");
@@ -1464,7 +1786,7 @@ struct VerificPass : public Pass {
 			return;
 		}
 
-		if (GetSize(args) > argidx && args[argidx] == "-sv") {
+		if (GetSize(args) > argidx && (args[argidx] == "-sv2012" || args[argidx] == "-sv")) {
 			for (argidx++; argidx < GetSize(args); argidx++)
 				if (!veri_file::Analyze(args[argidx].c_str(), veri_file::SYSTEM_VERILOG))
 					log_cmd_error("Reading `%s' in SYSTEM_VERILOG mode failed.\n", args[argidx].c_str());
@@ -1495,7 +1817,7 @@ struct VerificPass : public Pass {
 			return;
 		}
 
-		if (GetSize(args) > argidx && args[argidx] == "-vhdl2008") {
+		if (GetSize(args) > argidx && (args[argidx] == "-vhdl2008" || args[argidx] == "-vhdl")) {
 			vhdl_file::SetDefaultLibraryPath((proc_share_dirname() + "verific/vhdl_vdbs_2008").c_str());
 			for (argidx++; argidx < GetSize(args); argidx++)
 				if (!vhdl_file::Analyze(args[argidx].c_str(), "work", vhdl_file::VHDL_2008))
@@ -1515,6 +1837,7 @@ struct VerificPass : public Pass {
 		{
 			std::set<Netlist*> nl_todo, nl_done;
 			bool mode_all = false, mode_gates = false, mode_keep = false;
+			bool mode_nosva = false, mode_names = false;
 			bool verbose = false, flatten = false, extnets = false;
 			string dumpfile;
 
@@ -1537,6 +1860,14 @@ struct VerificPass : public Pass {
 				}
 				if (args[argidx] == "-k") {
 					mode_keep = true;
+					continue;
+				}
+				if (args[argidx] == "-nosva") {
+					mode_nosva = true;
+					continue;
+				}
+				if (args[argidx] == "-n") {
+					mode_names = true;
 					continue;
 				}
 				if (args[argidx] == "-v") {
@@ -1630,7 +1961,7 @@ struct VerificPass : public Pass {
 			while (!nl_todo.empty()) {
 				Netlist *nl = *nl_todo.begin();
 				if (nl_done.count(nl) == 0) {
-					VerificImporter importer(mode_gates, mode_keep, verbose);
+					VerificImporter importer(mode_gates, mode_keep, mode_nosva, mode_names, verbose);
 					importer.import_netlist(design, nl, nl_todo);
 				}
 				nl_todo.erase(nl);
